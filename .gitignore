@@ -1,0 +1,5 @@
+ckpt/*
+CLIP/ckpt/*
+data/*
+
+__pycache__

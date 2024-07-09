@@ -77,7 +77,7 @@ class CLIP_Inplanted(nn.Module):
         H = int(math.sqrt(L-1))
         out_attn = torch.zeros([H, H]).to('cuda')
 
-        for i in range(len(attn)):
+        for i in range(len(attn_out)):
             out_attn = out_attn + attn_out[i][0, 0, 1:].view(H, H)
         x = x.permute(1, 0, 2)
 

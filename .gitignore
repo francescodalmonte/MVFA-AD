@@ -1,5 +1,7 @@
 ckpt/*
+ckpt_r/*
 CLIP/ckpt/*
 data/*
+*.log
 
 __pycache__

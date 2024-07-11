@@ -2,6 +2,6 @@ ckpt/*
 ckpt_r/*
 CLIP/ckpt/*
 data/*
-*.log
+logs
 
 __pycache__

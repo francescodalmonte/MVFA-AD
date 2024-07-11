@@ -46,6 +46,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--save_model', type=int, default=1)
     parser.add_argument('--save_path', type=str, default='./ckpt_r/few-shot/')
+    parser.add_argument('--log_dir', type=str, default='./logs/')
     parser.add_argument('--img_size', type=int, default=240)
     parser.add_argument("--epoch", type=int, default=50, help="epochs")
     parser.add_argument("--learning_rate", type=float, default=0.001, help="learning rate")
@@ -78,7 +79,7 @@ def main():
     kwargs = {'num_workers': 2, 'pin_memory': True} if use_cuda else {}
     test_dataset = MedDataset(args.data_path, args.obj, args.img_size, args.shot, args.iterate)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, **kwargs)
-
+    print(f"Dataset size: {len(test_dataset)}")
 
     # few-shot image augmentation
     print("Applying augmentations...")
@@ -92,12 +93,12 @@ def main():
 
     train_dataset = torch.utils.data.TensorDataset(augment_fewshot_img, augment_fewshot_mask, augment_fewshot_label)
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, **kwargs)
-
+    print(f"Post-augmentation dataset size: {len(train_dataset)}")
 
     # memory bank construction
     support_dataset = torch.utils.data.TensorDataset(augment_normal_img)
     support_loader = torch.utils.data.DataLoader(support_dataset, batch_size=1, shuffle=True, **kwargs)
-
+    print(f"Support (memory bank) dataset size: {len(support_dataset)}")
 
     # losses
     loss_focal = FocalLoss()
@@ -225,7 +226,7 @@ def main():
         else:
             print("\n")
     
-    with open(f"logs/{args.obj}-losses.csv", "w") as file:
+    with open(f"{args.log_dir}/{args.obj}-losses.csv", "w") as file:
         k = losses_dict.keys()
         file.write(f"epoch, {', '.join(k)}\n")
         for e in range(len(losses_dict["total"])):
@@ -340,7 +341,7 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
 #        return seg_roc_auc + roc_auc_im
 
         # save AUROC and scores
-        with open(f"logs/{args.obj}-scores.csv", "w") as file:
+        with open(f"{args.log_dir}/{args.obj}-scores.csv", "w") as file:
             file.write(f"AUROC: {round(roc_auc_im, 5)}\n")
             file.write("img_score_zero, img_score_few\n")
             for i in range(seg_score_map_zero.shape[0]):
@@ -362,7 +363,7 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
         print(f'{args.obj} AUC : {round(img_roc_auc_det,4)}')
         
         # save AUROC and scores
-        with open(f"logs/{args.obj}-scores.csv", "w") as file:
+        with open(f"{args.log_dir}/{args.obj}-scores.csv", "w") as file:
             file.write(f"AUROC: {round(img_roc_auc_det, 5)}\n")
             file.write("img_score_zero, img_score_few\n")
             for i in range(image_scores.shape[0]):

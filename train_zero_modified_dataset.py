@@ -11,7 +11,7 @@ from torchvision.ops import focal_loss
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 #from scipy.ndimage import gaussian_filter
-from dataset.medical_zero import MedTestDataset, MedTrainDataset
+from dataset.medical_zero import MedTestDataset, MedTrainDataset_modified
 from CLIP.clip import create_model
 from CLIP.tokenizer import tokenize
 from CLIP.adapter import CLIP_Inplanted
@@ -41,6 +41,7 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    return 0
 
 
 def main():
@@ -91,8 +92,8 @@ def main():
     # load dataset and loader
     print("Loading dataset...")
     kwargs = {'num_workers': 4, 'pin_memory': True} if use_cuda else {}
-    train_dataset = MedTrainDataset(args.data_path, args.obj, args.img_size, args.batch_size)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, **kwargs)
+    train_dataset = MedTrainDataset_modified(args.data_path, args.obj, args.img_size)
+    train_loader = torch.utils.data.DataLoader(train_dataset, args.batch_size, shuffle=True, **kwargs)
     print(f"Train dataset size: {len(train_dataset)}")
 
     test_dataset = MedTestDataset(args.data_path, args.obj, args.img_size)
@@ -134,10 +135,11 @@ def main():
 
         for i, (image, image_label, mask, seg_idx) in enumerate(train_loader):
 
+            print(seg_idx)
+
             image = image.squeeze(0).to(device)
             image_label = image_label.squeeze(0).to(device)
             mask = mask.squeeze(0).to(device)
-            seg_idx = seg_idx.item()
 
 
             with torch.cuda.amp.autocast():
@@ -160,7 +162,7 @@ def main():
 
                 det_loss = torch.sum(torch.stack(det_loss))
 
-                if seg_idx > 0:
+                if seg_idx > 0: ######################## TODO: non parallelizable... seg_idx is not equal for all the batch
                     # pixel level
                     loss_f = []
                     loss_d = []
@@ -217,14 +219,14 @@ def main():
                     loss.backward()
                     det_optimizer.step()
 
-            #if (i>1) : ## ADDED
-            #    break
+            if (i%1==0) : ## ADDED
+                print(f"batch: {i}/{len(train_loader)} - loss: {loss.item():.5f}")
 
                 
         loss_list.append(loss.item())
 
-        train_dataset.shuffle_dataset()
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, **kwargs)
+        #train_dataset.shuffle_dataset()
+        #train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, **kwargs)
 
         # logs
 

@@ -116,7 +116,9 @@ class MedTrainDataset(Dataset):
                         else:
                             gt_path.append(single_file_path.replace('img', 'anomaly_mask'))
                     data.append([file_path, img_label, gt_path, CLASS_INDEX[class_name_one]])
+            
         random.shuffle(data)
+        
         return data
 
 
@@ -166,6 +168,117 @@ class MedTrainDataset(Dataset):
                     data.append([file_path, img_label, gt_path, CLASS_INDEX[class_name_one]])
         random.shuffle(data)
         self.data = data
+
+
+
+
+class MedTrainDataset_modified(Dataset):
+    """Modification of original MedTrainDataset, allowing the use of
+    Dataloader object's batch_size parameter, instead of fixing the batches at
+    Dataset object level. 
+
+    The original implementation was using "homogeneous" batches, i.e. all the
+    images in a batch were from the same obj class (with get_item method returning
+    batches of data instead of single samples), which could lead to
+    unstable training. In this modification the whole Dataset is simply shuffled and
+    get_item method returns single samples; the DataLoader object will be responsible
+    for creating batches.
+
+    """
+
+    def __init__(self,
+                 dataset_path='/data/',
+                 class_name='Brain',
+                 resize=240
+                 ):
+        assert class_name in CLASS_NAMES, 'class_name: {}, should be in {}'.format(class_name, CLASS_NAMES)
+
+        self.dataset_path = dataset_path
+        self.class_name = class_name
+        self.resize = resize
+
+        # load dataset
+        self.data = self.load_dataset_folder()
+
+        # set transforms
+        self.transform_x = transforms.Compose([
+            transforms.Resize((resize,resize), Image.BICUBIC),
+            transforms.ToTensor(),
+        ])
+
+        self.transform_mask = transforms.Compose(
+            [transforms.Resize((resize,resize), Image.NEAREST),
+             transforms.ToTensor()])
+
+            
+
+    def __getitem__(self, idx):
+        x, y, mask, seg_idx = self.data[idx]
+        y = torch.tensor(y).float()
+        seg_idx = torch.tensor(seg_idx)
+
+        img = Image.open(x).convert('RGB')
+        img = self.transform_x(img)
+
+        if seg_idx < 0:
+            return img, y, torch.zeros([1, self.resize, self.resize]), seg_idx
+        
+        else:
+            if mask is None:
+                mask = torch.zeros([1, self.resize, self.resize])
+            else:
+                mask = Image.open(mask).convert('L')
+                mask = self.transform_mask(mask)
+            return img, y, mask, seg_idx
+
+    def __len__(self):
+        return len(self.data)
+
+    def load_dataset_folder(self):
+        data_img = {}
+        for class_name_one in CLASS_NAMES:
+            if class_name_one != self.class_name:
+                data_img[class_name_one] = []
+                img_dir = os.path.join(self.dataset_path, f'{class_name_one}_AD/test/good/img')
+                for f in os.listdir(img_dir):
+                    data_img[class_name_one].append((os.path.join(img_dir, f), 0))
+
+                img_dir = os.path.join(self.dataset_path, f'{class_name_one}_AD/test/Ungood/img')
+                for f in os.listdir(img_dir):
+                    data_img[class_name_one].append((os.path.join(img_dir, f), 1))
+                random.shuffle(data_img[class_name_one])
+
+        # discard samples to balance the classes (***TODO: suboptimal...)
+        N = np.min([len(data_img[class_name_one]) for class_name_one in data_img.keys()])
+        for class_name_one in data_img.keys():
+            data_img[class_name_one] = data_img[class_name_one][:N]
+
+        data = []
+
+        for class_name_one in data_img.keys():
+            if CLASS_INDEX[class_name_one] < 0:
+                for image_index in range(0, len(data_img[class_name_one])):
+                    file_path = data_img[class_name_one][image_index][0]
+                    img_label = data_img[class_name_one][image_index][1]
+
+                    data.append([file_path, img_label, None, CLASS_INDEX[class_name_one]])
+            else:
+                for image_index in range(0, len(data_img[class_name_one])):
+                    file_path = data_img[class_name_one][image_index][0]
+                    img_label = data_img[class_name_one][image_index][1]
+
+                    if img_label == 0:
+                        gt_path = None
+                    else:
+                        gt_path = file_path.replace('img', 'anomaly_mask')
+
+                    data.append([file_path, img_label, gt_path, CLASS_INDEX[class_name_one]])
+            
+        random.shuffle(data)
+        return data
+
+
+
 
 
 

@@ -221,7 +221,7 @@ class MedTrainDataset_modified(Dataset):
         img = self.transform_x(img)
 
         if seg_idx < 0:
-            return img, y, torch.zeros([1, self.resize, self.resize]), seg_idx
+            return img, y, torch.zeros([1, self.resize, self.resize])*torch.nan, seg_idx
         
         else:
             if mask is None:
@@ -249,7 +249,9 @@ class MedTrainDataset_modified(Dataset):
                 random.shuffle(data_img[class_name_one])
 
         # discard samples to balance the classes (***TODO: suboptimal...)
-        N = np.min([len(data_img[class_name_one]) for class_name_one in data_img.keys()])
+        #N = np.min([len(data_img[class_name_one]) for class_name_one in data_img.keys()])
+        N = 2000
+        print("NB: setting N to 2000")
         for class_name_one in data_img.keys():
             data_img[class_name_one] = data_img[class_name_one][:N]
 

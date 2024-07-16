@@ -57,7 +57,7 @@ def main():
     parser.add_argument('--test_batch_size', type=int, default=1)
     parser.add_argument('--img_size', type=int, default=240)
     parser.add_argument("--epoch", type=int, default=50, help="epochs")
-    parser.add_argument("--learning_rate", type=float, default=0.0001, help="learning rate")
+    parser.add_argument("--learning_rate", type=float, default=0.001, help="learning rate")
     parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24], help="features used")
     parser.add_argument('--seed', type=int, default=111)
     args = parser.parse_args()
@@ -116,7 +116,7 @@ def main():
             text_feature_list.append(text_feature)
 
     save_score = 0.0
-    losses_dict = {
+    epoch_losses_dict = {
         "focal" : [],
         "dice" : [],
         "bce" : [],
@@ -130,17 +130,13 @@ def main():
         focal_loss_list = []
         dice_loss_list = []
         bce_loss_list = []
-
-        loss_list = []
+        tot_loss_list = []
 
         for i, (image, image_label, mask, seg_idx) in enumerate(train_loader):
 
-            print(seg_idx)
-
-            image = image.squeeze(0).to(device)
-            image_label = image_label.squeeze(0).to(device)
-            mask = mask.squeeze(0).to(device)
-
+            image = image.to(device)
+            image_label = image_label.to(device)
+            mask = mask.to(device)
 
             with torch.cuda.amp.autocast():
                 _, seg_patch_tokens, det_patch_tokens = model(image)
@@ -150,94 +146,99 @@ def main():
                 seg_patch_tokens = torch.permute(seg_patch_tokens, (1, 0, 2, 3)) # shape: B x 4 x 289 x 768
                 det_patch_tokens = torch.permute(det_patch_tokens, (1, 0, 2, 3))
 
-                # image level
-                det_patch_tokens = det_patch_tokens / det_patch_tokens.norm(dim=-1, keepdim=True)
-                anomaly_map = (100.0 * det_patch_tokens @ text_feature_list[seg_idx]) # shape: B x 4 x 289 x 2
-                anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, :, 1]
+                # arrange pre-extracted text features in a tensor
+                text_feature_batch = torch.stack([text_feature_list[s] for s in seg_idx]) # shape: B x 768 x 2
+
+
+
+                # 1. IMAGE LEVEL LOSS
+                det_patch_tokens = det_patch_tokens / det_patch_tokens.norm(dim=-1, keepdim=True) # shape: B x 4 x 289 x 768
+                
+                # multiply DET tokens with text features (TODO: parallelize)
+                anomaly_map = []
+                for b in range(det_patch_tokens.shape[0]):
+                    anomaly_map.append((100.0 * det_patch_tokens[b, :, :, :] @ text_feature_batch[b]))
+                anomaly_map = torch.stack(anomaly_map) # shape: B x 4 x 289 x 2
+                anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, :, 1] # shape: B x 4 x 289
                 anomaly_score = torch.mean(anomaly_map, dim=-1) # shape: B x 4
 
-                det_loss = []
+                # compute det loss (bce)
+                det_loss = 0
                 for l in range(anomaly_score.shape[1]):
-                    det_loss.append(loss_bce(anomaly_score[:, l], image_label))
+                    det_loss = det_loss + loss_bce(anomaly_score[:, l], image_label)
+                det_loss = det_loss/len(anomaly_score.shape[1])
 
-                det_loss = torch.sum(torch.stack(det_loss))
+                # 2. PIXEL LEVEL LOSS
+                # only keep elements of the batch that have a segmentation mask
+                tokeep_mask = (seg_idx > 0)
+                # if num of kept samples is < 4, skip this batch
+                if tokeep_mask.sum() < 4:
+                    continue
+                seg_patch_tokens = seg_patch_tokens[tokeep_mask]
+                text_feature_batch = text_feature_batch[tokeep_mask]
+                mask = mask[tokeep_mask]
 
-                if seg_idx > 0: ######################## TODO: non parallelizable... seg_idx is not equal for all the batch
-                    # pixel level
-                    loss_f = []
-                    loss_d = []
-                    mask[mask > 0.5], mask[mask <= 0.5] = 1, 0
+                seg_patch_tokens = seg_patch_tokens / seg_patch_tokens.norm(dim=-1, keepdim=True)
 
-                    seg_patch_tokens = seg_patch_tokens / seg_patch_tokens.norm(dim=-1, keepdim=True)
-                    anomaly_map = (100.0 * seg_patch_tokens @ text_feature_list[seg_idx]) # shape: B x 4 x 289 x 2
-                    anomaly_map = torch.softmax(anomaly_map, dim=3)[:,:,:,1] # shape: B x 4 x 289
+                # multiply SEG tokens with text features (TODO: parallelize)
+                anomaly_map = []
+                for b in range(seg_patch_tokens.shape[0]):
+                    anomaly_map.append((100.0 * seg_patch_tokens[b, :, :, :] @ text_feature_batch[b]))
+                anomaly_map = torch.stack(anomaly_map) # shape: B* x 4 x 289 x 2
+                anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, :, 1] # shape: B* x 4 x 289
 
-                    B, L, P = anomaly_map.shape
-                    H = int(np.sqrt(P))
+                # resize/reshape anomaly_map to image size
+                B, L, P = anomaly_map.shape
+                H = int(np.sqrt(P))
+                anomaly_map = F.interpolate(anomaly_map.view(B, L, H, H),
+                                            size=args.img_size, mode='bilinear', align_corners=True) # shape: B* x 4 x H x H
 
-                    anomaly_map = F.interpolate(anomaly_map.view(B, L, H, H),
-                                                size=args.img_size, mode='bilinear', align_corners=True) # shape: B x 4 x H x H
+                # binarize mask (keeping into account nan values)
+                mask[mask>0.5], mask[mask<=0.5] = 1, 0
+
+                # compute seg loss (focal + dice)     
+                loss_f = 0
+                loss_d = 0
+                for l in range(anomaly_map.shape[1]):
+                    loss_f = loss_f + (loss_focal(anomaly_map[:, l, :, :], mask[:, 0, :, :], alpha=0.5, gamma=2, reduction='mean'))
+                    loss_d = loss_d + (loss_dice(anomaly_map[:, l, :, :], mask[:, 0, :, :]))
+                loss_f = loss_f/anomaly_map.shape[1]
+                loss_d = loss_d/anomaly_map.shape[1]
+                # total segmentation loss
+                seg_loss = loss_d + loss_f
                     
-                    for l in range(anomaly_map.shape[1]):
-                        loss_f.append(loss_focal(anomaly_map[:, l, :, :], mask[:, 0, :, :], reduction='mean'))
-                        loss_d.append(loss_dice(anomaly_map[:, l, :, :], mask[:, 0, :, :]))
+                # total loss
+                tot_loss = seg_loss + det_loss
 
-                    # losses
-                    loss_f = torch.sum(torch.stack(loss_f))
-                    loss_d = torch.sum(torch.stack(loss_d))
-                    seg_loss = loss_d + loss_f
+                # store losses
+                bce_loss_list.append(det_loss.item())
+                focal_loss_list.append(loss_f.item())
+                dice_loss_list.append(loss_d.item())
+                tot_loss_list.append(tot_loss.item())
 
-                    
-                    # total loss
-                    loss = seg_loss + det_loss
+                # backward pass
+                tot_loss.requires_grad_(True)
+                seg_optimizer.zero_grad()
+                det_optimizer.zero_grad()
+                tot_loss.backward()
+                seg_optimizer.step()
+                det_optimizer.step()
 
-                    # store losses
-                    bce_loss_list.append(det_loss.item())
-                    focal_loss_list.append(loss_f.item())
-                    dice_loss_list.append(loss_d.item())
 
-                    # backward pass
-                    loss.requires_grad_(True)
-                    seg_optimizer.zero_grad()
-                    det_optimizer.zero_grad()
-                    loss.backward()
-                    seg_optimizer.step()
-                    det_optimizer.step()
+            #if (i%1==0) : ## ADDED
+            #    print(f"batch: {i}/{len(train_loader)} - tot loss: {tot_loss.item():.5f}")
 
-                else:
-                    # total loss
-                    loss = det_loss
-
-                    # store losses
-                    bce_loss_list.append(det_loss.item())
-                    focal_loss_list.append(0)
-                    dice_loss_list.append(0)
-
-                    # backward pass
-                    loss.requires_grad_(True)
-                    det_optimizer.zero_grad()
-                    loss.backward()
-                    det_optimizer.step()
-
-            if (i%1==0) : ## ADDED
-                print(f"batch: {i}/{len(train_loader)} - loss: {loss.item():.5f}")
-
-                
-        loss_list.append(loss.item())
-
-        #train_dataset.shuffle_dataset()
-        #train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, **kwargs)
 
         # logs
+        epoch_losses_dict["focal"].append(np.mean(focal_loss_list))
+        epoch_losses_dict["dice"].append(np.mean(dice_loss_list))
+        epoch_losses_dict["bce"].append(np.mean(bce_loss_list))
+        epoch_losses_dict["total"].append(np.mean(tot_loss_list))
 
-        epoch_loss = np.mean(loss_list)
-        print(f"TOT LOSS: {epoch_loss:.5f} - elapsed time: {time.time()-start_time:.2f}s")
-
-        losses_dict["focal"].append(np.mean(focal_loss_list))
-        losses_dict["dice"].append(np.mean(dice_loss_list))
-        losses_dict["bce"].append(np.mean(bce_loss_list))
-        losses_dict["total"].append(epoch_loss)
-
+        print(f"TOT LOSS: {epoch_losses_dict['total'][-1]:.5f} - elapsed time: {time.time()-start_time:.2f}s")
+        print(f"FOCAL LOSS: {epoch_losses_dict['focal'][-1]:.5f}", end=" - ")
+        print(f"DICE LOSS: {epoch_losses_dict['dice'][-1]:.5f}", end=" - ")
+        print(f"BCE LOSS: {epoch_losses_dict['bce'][-1]:.5f}")
 
         # test on every epoch
         if (epoch > -1) : ## ADDED
@@ -251,10 +252,10 @@ def main():
                                 ckp_path)        
         
     with open(f"{args.log_dir}/{args.obj}-losses.csv", "w") as file:
-        k = losses_dict.keys()
+        k = epoch_losses_dict.keys()
         file.write(f"epoch, {', '.join(k)}\n")
-        for e in range(len(losses_dict["total"])):
-            file.write(f"{e}, {losses_dict['focal'][e]}, {losses_dict['dice'][e]}, {losses_dict['bce'][e]}, {losses_dict['total'][e]}\n")
+        for e in range(len(epoch_losses_dict["total"])):
+            file.write(f"{e}, {epoch_losses_dict['focal'][e]}, {epoch_losses_dict['dice'][e]}, {epoch_losses_dict['bce'][e]}, {epoch_losses_dict['total'][e]}\n")
 
 
 def test(args, seg_model, test_loader, text_features):

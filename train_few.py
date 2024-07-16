@@ -57,6 +57,8 @@ def main():
     args = parser.parse_args()
 
     setup_seed(args.seed)
+
+    print(f"OBJECT: {args.obj}")
     
     # fixed feature extractor
     print("Instantiating model...")
@@ -76,7 +78,7 @@ def main():
 
     # load test dataset
     print("Loading dataset...")
-    kwargs = {'num_workers': 2, 'pin_memory': True} if use_cuda else {}
+    kwargs = {'num_workers': 4, 'pin_memory': True} if use_cuda else {}
     test_dataset = MedDataset(args.data_path, args.obj, args.img_size, args.shot, args.iterate)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, **kwargs)
     print(f"Dataset size: {len(test_dataset)}")
@@ -125,7 +127,7 @@ def main():
         focal_loss_list = []
         dice_loss_list = []
         bce_loss_list = []
-        
+
         loss_list = []
 
         for (image, gt, label) in train_loader:
@@ -150,7 +152,6 @@ def main():
                     # pixel level
                     loss_f = 0
                     loss_d = 0
-                    seg_loss = 0
                     mask = gt.squeeze(0).to(device)
                     mask[mask > 0.5], mask[mask <= 0.5] = 1, 0
                     for layer in range(len(seg_patch_tokens)):
@@ -164,9 +165,7 @@ def main():
 
                         loss_f += loss_focal(anomaly_map, mask)
                         loss_d += loss_dice(anomaly_map[:, 1, :, :], mask)
-                        seg_loss += loss_f
-                        seg_loss += loss_d
-
+                    seg_loss = loss_f + loss_d
                     loss = seg_loss + det_loss
 
                     focal_loss_list.append(loss_f.item())
@@ -182,8 +181,8 @@ def main():
                 else:
                     loss = det_loss
 
-                    focal_loss_list.append(0)
-                    dice_loss_list.append(0)
+                    focal_loss_list.append(np.nan)
+                    dice_loss_list.append(np.nan)
 
                     loss.requires_grad_(True)
                     det_optimizer.zero_grad()
@@ -193,10 +192,10 @@ def main():
                 loss_list.append(loss.item())
 
         epoch_loss = np.mean(loss_list)
-        print("Loss: ", epoch_loss)
+        print(f"EPOCH LOSS: {epoch_loss:.8f}, FOCAL LOSS: {np.nanmean(focal_loss_list):.8f}, DICE LOSS: {np.nanmean(dice_loss_list):.8f}, BCE LOSS: {np.mean(bce_loss_list):.8f}")
 
-        losses_dict["focal"].append(np.mean(focal_loss_list))
-        losses_dict["dice"].append(np.mean(dice_loss_list))
+        losses_dict["focal"].append(np.nanmean(focal_loss_list))
+        losses_dict["dice"].append(np.nanmean(dice_loss_list))
         losses_dict["bce"].append(np.mean(bce_loss_list))
         losses_dict["total"].append(epoch_loss)
 
@@ -213,11 +212,10 @@ def main():
         seg_mem_features = [torch.cat([seg_features[j][i] for j in range(len(seg_features))], dim=0) for i in range(len(seg_features[0]))]
         det_mem_features = [torch.cat([det_features[j][i] for j in range(len(det_features))], dim=0) for i in range(len(det_features[0]))]
         
-        if epoch == (args.epoch - 1):
+        if epoch > -1:
             result = test(args, model, test_loader, text_features, seg_mem_features, det_mem_features)
             if result > best_result:
                 best_result = result
-                print("Best result\n")
                 if args.save_model == 1:
                     ckp_path = os.path.join(args.save_path, f'{args.obj}.pth')
                     torch.save({'seg_adapters': model.seg_adapters.state_dict(),
@@ -237,7 +235,7 @@ def main():
 
 def test(args, model, test_loader, text_features, seg_mem_features, det_mem_features):
 
-    print("Running test...")
+    print("Running test...", end=" ")
 
     gt_list = []
     gt_mask_list = []
@@ -322,8 +320,6 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
 
 
     if CLASS_INDEX[args.obj] > 0:
-        print("Evaluation (with segmentation)...")
-
         seg_score_map_zero = np.array(seg_score_map_zero)
         seg_score_map_few = np.array(seg_score_map_few)
 
@@ -332,11 +328,11 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
     
         segment_scores = 0.5 * seg_score_map_zero + 0.5 * seg_score_map_few
 #        seg_roc_auc = roc_auc_score(gt_mask_list.flatten(), segment_scores.flatten())
-#        print(f'{args.obj} pAUC : {round(seg_roc_auc,4)}')
+#        print(f'pAUC : {round(seg_roc_auc,4)}')
 
         segment_scores_flatten = segment_scores.reshape(segment_scores.shape[0], -1)
         roc_auc_im = roc_auc_score(gt_list, np.max(segment_scores_flatten, axis=1))
-        print(f'{args.obj} AUC : {round(roc_auc_im, 4)}')
+        print(f'AUC : {round(roc_auc_im, 4)}')
 
 #        return seg_roc_auc + roc_auc_im
 
@@ -350,8 +346,6 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
         return roc_auc_im
 
     else:
-        print("Evaluation (without segmentation)...")
-
         det_image_scores_zero = np.array(det_image_scores_zero)
         det_image_scores_few = np.array(det_image_scores_few)
 
@@ -360,14 +354,14 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
     
         image_scores = 0.5 * det_image_scores_zero + 0.5 * det_image_scores_few
         img_roc_auc_det = roc_auc_score(gt_list, image_scores)
-        print(f'{args.obj} AUC : {round(img_roc_auc_det,4)}')
+        print(f'AUC : {round(img_roc_auc_det,4)}')
         
         # save AUROC and scores
-        with open(f"{args.log_dir}/{args.obj}-scores.csv", "w") as file:
-            file.write(f"AUROC: {round(img_roc_auc_det, 5)}\n")
-            file.write("img_score_zero, img_score_few\n")
-            for i in range(image_scores.shape[0]):
-                file.write(f"{det_image_scores_zero[i]}, {det_image_scores_few[i]}\n")
+        #with open(f"{args.log_dir}/{args.obj}-scores.csv", "w") as file:
+        #    file.write(f"AUROC: {round(img_roc_auc_det, 5)}\n")
+        #    file.write("img_score_zero, img_score_few\n")
+        #    for i in range(image_scores.shape[0]):
+        #        file.write(f"{det_image_scores_zero[i]}, {det_image_scores_few[i]}\n")
         
         return img_roc_auc_det
 

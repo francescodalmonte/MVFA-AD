@@ -2,6 +2,10 @@ ckpt/*
 ckpt_r/*
 CLIP/ckpt/*
 data/*
+data_zip
 logs
+
+*.sh
+results*
 
 __pycache__

@@ -36,6 +36,18 @@ def cos_sim(a, b, eps=1e-8):
     sim_mt = torch.mm(a_norm, b_norm.transpose(0, 1))
     return sim_mt
 
+def cos_sim_parallel(a, b, eps=1e-8):
+    """a shape: N x D
+       b shape: B x M x D
+       return shape: B x M x N
+    """
+    a_n = a.norm(dim=1)[:, None]
+    b_n = b.norm(dim=2)[:, :, None]
+    a_norm = a / torch.clamp(a_n, min=eps)
+    b_norm = b / torch.clamp(b_n, min=eps)
+    sim_mt = torch.matmul(b_norm, a_norm.transpose(0,1))
+    return sim_mt
+
 
 def get_rot_mat(theta):
     theta = torch.tensor(theta)

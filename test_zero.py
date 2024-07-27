@@ -46,7 +46,8 @@ def main():
     parser.add_argument('--data_path', type=str, default='./data/')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--img_size', type=int, default=240)
-    parser.add_argument('--save_path', type=str, default='./ckpt/zero-shot/')
+    parser.add_argument('--ckpt_path', type=str, default='./ckpt/few-shot/')
+    parser.add_argument('--ckpt_epoch', type=str, default=0)
     parser.add_argument("--epoch", type=int, default=50, help="epochs")
     parser.add_argument("--learning_rate", type=float, default=0.0001, help="learning rate")
     parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24], help="features used")
@@ -54,6 +55,7 @@ def main():
     args = parser.parse_args()
 
     setup_seed(args.seed)
+    print(f"OBJECT: {args.obj}")
     
     # fixed feature extractor
     clip_model = create_model(model_name=args.model_name, img_size=args.img_size, device=device, pretrained=args.pretrain, require_pretrained=True)
@@ -62,9 +64,10 @@ def main():
     model = CLIP_Inplanted(clip_model=clip_model, features=args.features_list).to(device)
     model.eval()
 
-    checkpoint = torch.load(os.path.join(f'{args.save_path}', f'{args.obj}.pth'))
-    model.seg_adapters.load_state_dict(checkpoint["seg_adapters"])
-    model.det_adapters.load_state_dict(checkpoint["det_adapters"])
+    # for single epoch test
+#    checkpoint = torch.load(os.path.join(f'{args.ckpt_path}', f'{args.obj}-{args.ckpt_epoch}.pth'))
+#    model.seg_adapters.load_state_dict(checkpoint["seg_adapters"])
+#    model.det_adapters.load_state_dict(checkpoint["det_adapters"])
 
 
     # optimizer for only adapters
@@ -87,15 +90,21 @@ def main():
     loss_bce = torch.nn.BCEWithLogitsLoss()
 
 
-    text_feature_list = [0]
     # text prompt
     with torch.cuda.amp.autocast(), torch.no_grad():
-        for i in [1,2,3,-3,-2,-1]:
-            text_feature = encode_text_with_prompt_ensemble(clip_model, REAL_NAME[CLASS_INDEX_INV[i]], device)
-            text_feature_list.append(text_feature)
+        text_features = encode_text_with_prompt_ensemble(clip_model, REAL_NAME[args.obj], device)
+    
+    # for single epoch test
+#    result = test(args, model, test_loader, text_features)
 
-    score = test(args, model, test_loader, text_feature_list[CLASS_INDEX[args.obj]])
-        
+    # for multiple epochs test
+    for epoch in range(50):
+        checkpoint = torch.load(os.path.join(f'{args.ckpt_path}', f'{args.obj}-{epoch}.pth'), map_location=device)
+        model.seg_adapters.load_state_dict(checkpoint["seg_adapters"])
+        model.det_adapters.load_state_dict(checkpoint["det_adapters"])
+
+        print(f"epoch {epoch}", end=" - ")
+        _ = test(args, model, test_loader, text_features)      
 
 
 def test(args, seg_model, test_loader, text_features):
@@ -104,7 +113,7 @@ def test(args, seg_model, test_loader, text_features):
     image_scores = []
     segment_scores = []
     
-    for (image, y, mask) in tqdm(test_loader):
+    for _, (image, y, mask) in enumerate(test_loader):
         image = image.to(device)
         mask[mask > 0.5], mask[mask <= 0.5] = 1, 0
 

@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from tqdm import tqdm
+#from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
 from dataset.medical_few import MedDataset
 from CLIP.clip import create_model
@@ -47,7 +47,8 @@ def main():
     parser.add_argument('--data_path', type=str, default='./data/')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--save_model', type=int, default=1)
-    parser.add_argument('--save_path', type=str, default='./ckpt/few-shot/')
+    parser.add_argument('--ckpt_path', type=str, default='./ckpt/few-shot/')
+    parser.add_argument('--ckpt_epoch', type=str, default=0)
     parser.add_argument('--img_size', type=int, default=240)
     parser.add_argument("--epoch", type=int, default=50, help="epochs")
     parser.add_argument("--learning_rate", type=float, default=0.001, help="learning rate")
@@ -58,6 +59,8 @@ def main():
     args = parser.parse_args()
 
     setup_seed(args.seed)
+    print(f"OBJECT: {args.obj}")
+
     
     # fixed feature extractor
     clip_model = create_model(model_name=args.model_name, img_size=args.img_size, device=device, pretrained=args.pretrain, require_pretrained=True)
@@ -66,9 +69,10 @@ def main():
     model = CLIP_Inplanted(clip_model=clip_model, features=args.features_list).to(device)
     model.eval()
 
-    checkpoint = torch.load(os.path.join(f'{args.save_path}', f'{args.obj}.pth'))
-    model.seg_adapters.load_state_dict(checkpoint["seg_adapters"])
-    model.det_adapters.load_state_dict(checkpoint["det_adapters"])
+    # for single epoch test
+#    checkpoint = torch.load(os.path.join(f'{args.ckpt_path}', f'{args.obj}-{args.ckpt_epoch}.pth'))
+#    model.seg_adapters.load_state_dict(checkpoint["seg_adapters"])
+#    model.det_adapters.load_state_dict(checkpoint["det_adapters"])
 
     for name, param in model.named_parameters():
         param.requires_grad = True
@@ -115,22 +119,32 @@ def main():
 
     best_result = 0
 
-    seg_features = []
-    det_features = []
-    for image in support_loader:
-        image = image[0].to(device)
-        with torch.no_grad():
-            _, seg_patch_tokens, det_patch_tokens = model(image)
-            seg_patch_tokens = [p[0].contiguous() for p in seg_patch_tokens]
-            det_patch_tokens = [p[0].contiguous() for p in det_patch_tokens]
-            seg_features.append(seg_patch_tokens)
-            det_features.append(det_patch_tokens)
-    seg_mem_features = [torch.cat([seg_features[j][i] for j in range(len(seg_features))], dim=0) for i in range(len(seg_features[0]))]
-    det_mem_features = [torch.cat([det_features[j][i] for j in range(len(det_features))], dim=0) for i in range(len(det_features[0]))]
+
+    # for single epoch test
+#    result = test(args, model, test_loader, text_features, seg_mem_features, det_mem_features)
+
+    # for multiple epochs test
+    for epoch in range(33,50):
+        checkpoint = torch.load(os.path.join(f'{args.ckpt_path}', f'{args.obj}-{epoch}.pth'), map_location=device)
+        model.seg_adapters.load_state_dict(checkpoint["seg_adapters"])
+        model.det_adapters.load_state_dict(checkpoint["det_adapters"])
+
+        seg_features = []
+        det_features = []
+        for image in support_loader:
+            image = image[0].to(device)
+            with torch.no_grad():
+                _, seg_patch_tokens, det_patch_tokens = model(image)
+                seg_patch_tokens = [p[0].contiguous() for p in seg_patch_tokens]
+                det_patch_tokens = [p[0].contiguous() for p in det_patch_tokens]
+                seg_features.append(seg_patch_tokens)
+                det_features.append(det_patch_tokens)
+        seg_mem_features = [torch.cat([seg_features[j][i] for j in range(len(seg_features))], dim=0) for i in range(len(seg_features[0]))]
+        det_mem_features = [torch.cat([det_features[j][i] for j in range(len(det_features))], dim=0) for i in range(len(det_features[0]))]
     
 
-    result = test(args, model, test_loader, text_features, seg_mem_features, det_mem_features)
-
+        print(f"epoch {epoch}", end=" - ")
+        _ = test(args, model, test_loader, text_features, seg_mem_features, det_mem_features)    
 
 def test(args, model, test_loader, text_features, seg_mem_features, det_mem_features):
     gt_list = []
@@ -142,7 +156,7 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
     seg_score_map_zero = []
     seg_score_map_few= []
 
-    for (image, y, mask) in tqdm(test_loader):
+    for _, (image, y, mask) in enumerate(test_loader):
         image = image.to(device)
         mask[mask > 0.5], mask[mask <= 0.5] = 1, 0
 

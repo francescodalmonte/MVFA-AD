@@ -251,7 +251,7 @@ class MedTrainDataset_modified(Dataset):
         # discard samples to balance the classes (***TODO: suboptimal...)
         #N = np.min([len(data_img[class_name_one]) for class_name_one in data_img.keys()])
         N = 2000
-        print("NB: setting N to 2000")
+        print(f"NB: setting N to {N}")
         for class_name_one in data_img.keys():
             data_img[class_name_one] = data_img[class_name_one][:N]
 
@@ -356,3 +356,77 @@ class MedTestDataset(Dataset):
         assert len(x) == len(y), 'number of x and y should be same'
         return list(x), list(y), list(mask)
 
+
+class MedValDataset(Dataset):
+    """(Added) validation dataset for zero-shot learning. 
+    Equal to MedDataset, but takes data from /valid folder.
+    """
+    def __init__(self,
+                 dataset_path='/data/',
+                 class_name='Brain',
+                 resize=240
+                 ):
+        assert class_name in CLASS_NAMES, 'class_name: {}, should be in {}'.format(class_name, CLASS_NAMES)
+
+        self.dataset_path = os.path.join(dataset_path, f'{class_name}_AD')
+        self.class_name = class_name
+        self.seg_flag = CLASS_INDEX[class_name]
+        self.resize = resize
+
+        # load dataset
+        self.x, self.y, self.mask = self.load_dataset_folder(self.seg_flag)
+
+        # set transforms
+        self.transform_x = transforms.Compose([
+            transforms.Resize((resize,resize), Image.BICUBIC),
+            transforms.ToTensor(),
+        ])
+
+        self.transform_mask = transforms.Compose(
+            [transforms.Resize((resize,resize), Image.NEAREST),
+             transforms.ToTensor()])
+
+
+    def __getitem__(self, idx):
+        x, y, mask = self.x[idx], self.y[idx], self.mask[idx]
+        x = Image.open(x).convert('RGB')
+        x_img = self.transform_x(x)
+
+        if self.seg_flag < 0:
+            return x_img, y, torch.zeros([1, self.resize, self.resize])
+
+        if mask is None:
+            mask = torch.zeros([1, self.resize, self.resize])
+            y = 0
+        else:
+            mask = Image.open(mask).convert('L')
+            mask = self.transform_mask(mask)
+            y = 1
+        return x_img, y, mask
+
+    def __len__(self):
+        return len(self.x)
+
+    def load_dataset_folder(self, seg_flag):
+        x, y, mask = [], [], []
+
+        normal_img_dir = os.path.join(self.dataset_path, 'valid/good/img')
+        img_fpath_list = sorted([os.path.join(normal_img_dir, f) for f in os.listdir(normal_img_dir)])
+        x.extend(img_fpath_list)
+        y.extend([0] * len(img_fpath_list))
+        mask.extend([None] * len(img_fpath_list))
+
+        abnorm_img_dir = os.path.join(self.dataset_path, 'valid/Ungood/img')
+        img_fpath_list = sorted([os.path.join(abnorm_img_dir, f) for f in os.listdir(abnorm_img_dir)])
+        x.extend(img_fpath_list)
+        y.extend([1] * len(img_fpath_list))
+
+        if seg_flag > 0:
+            gt_type_dir = os.path.join(self.dataset_path, 'valid/Ungood/anomaly_mask')
+            gt_fpath_list = sorted([os.path.join(gt_type_dir, f) for f in os.listdir(gt_type_dir)])
+            mask.extend(gt_fpath_list)
+        else:
+            mask.extend([None] * len(img_fpath_list))
+
+        assert len(x) == len(y), 'number of x and y should be same'
+        return list(x), list(y), list(mask)

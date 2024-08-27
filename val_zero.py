@@ -1,19 +1,19 @@
 import os
 import argparse
 import random
-import math
+#import math
 import numpy as np
 import torch
-from torch import nn
+#from torch import nn
 from torch.nn import functional as F
-from tqdm import tqdm
+#from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
-from scipy.ndimage import gaussian_filter
-from dataset.medical_zero import MedTestDataset, MedTrainDataset
+#from scipy.ndimage import gaussian_filter
+from dataset.medical_zero import MedTestDataset, MedValDataset
 from CLIP.clip import create_model
 from CLIP.tokenizer import tokenize
 from CLIP.adapter import CLIP_Inplanted
-from PIL import Image
+#from PIL import Image
 from sklearn.metrics import precision_recall_curve
 from loss import FocalLoss, BinaryDiceLoss
 from utils import augment, encode_text_with_prompt_ensemble
@@ -24,6 +24,8 @@ warnings.filterwarnings("ignore")
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda:0" if use_cuda else "cpu")
+
+print(f"Running on: {device}")
 
 CLASS_INDEX = {'Brain':3, 'Liver':2, 'Retina_RESC':1, 'Retina_OCT2017':-1, 'Chest':-2, 'Histopathology':-3}
 CLASS_INDEX_INV = {3:'Brain', 2:'Liver', 1:'Retina_RESC', -1:'Retina_OCT2017', -2:'Chest', -3:'Histopathology'}
@@ -45,17 +47,13 @@ def main():
     parser.add_argument('--obj', type=str, default='Retina_RESC')
     parser.add_argument('--data_path', type=str, default='./data/')
     parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--ckpt_path', type=str, default='./ckpt/few-shot/') # changed
     parser.add_argument('--img_size', type=int, default=240)
-    parser.add_argument('--ckpt_path', type=str, default='./ckpt/few-shot/')
-    parser.add_argument('--ckpt_epoch', type=str, default=0)
-    parser.add_argument("--epoch", type=int, default=50, help="epochs")
-    parser.add_argument("--learning_rate", type=float, default=0.0001, help="learning rate")
     parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24], help="features used")
     parser.add_argument('--seed', type=int, default=111)
     args = parser.parse_args()
 
     setup_seed(args.seed)
-    print(f"OBJECT: {args.obj}")
     
     # fixed feature extractor
     clip_model = create_model(model_name=args.model_name, img_size=args.img_size, device=device, pretrained=args.pretrain, require_pretrained=True)
@@ -64,47 +62,27 @@ def main():
     model = CLIP_Inplanted(clip_model=clip_model, features=args.features_list).to(device)
     model.eval()
 
-    # for single epoch test
-#    checkpoint = torch.load(os.path.join(f'{args.ckpt_path}', f'{args.obj}-{args.ckpt_epoch}.pth'))
-#    model.seg_adapters.load_state_dict(checkpoint["seg_adapters"])
-#    model.det_adapters.load_state_dict(checkpoint["det_adapters"])
 
-
-    # optimizer for only adapters
-    seg_optimizer = torch.optim.Adam(list(model.seg_adapters.parameters()), lr=args.learning_rate, betas=(0.5, 0.999))
-    det_optimizer = torch.optim.Adam(list(model.det_adapters.parameters()), lr=args.learning_rate, betas=(0.5, 0.999))
-
-
-    # load dataset and loader
+    # load val dataset
     kwargs = {'num_workers': 4, 'pin_memory': True} if use_cuda else {}
-    train_dataset = MedTrainDataset(args.data_path, args.obj, args.img_size, args.batch_size)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, **kwargs)
+    val_dataset = MedValDataset(args.data_path, args.obj, args.img_size)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, **kwargs)
 
-    test_dataset = MedTestDataset(args.data_path, args.obj, args.img_size)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, **kwargs)
-
-
-    # losses
-    loss_focal = FocalLoss()
-    loss_dice = BinaryDiceLoss()
-    loss_bce = torch.nn.BCEWithLogitsLoss()
-
+    print(f"len val Dataset: {len(val_dataset)}")
+    print(f"len val Dataloader : {len(val_loader)}")
 
     # text prompt
     with torch.cuda.amp.autocast(), torch.no_grad():
         text_features = encode_text_with_prompt_ensemble(clip_model, REAL_NAME[args.obj], device)
-    
-    # for single epoch test
-#    result = test(args, model, test_loader, text_features)
 
-    # for multiple epochs test
-    for epoch in range(42, 52):
+    for epoch in range(50):
         checkpoint = torch.load(os.path.join(f'{args.ckpt_path}', f'{args.obj}-{epoch}.pth'), map_location=device)
         model.seg_adapters.load_state_dict(checkpoint["seg_adapters"])
         model.det_adapters.load_state_dict(checkpoint["det_adapters"])
 
         print(f"epoch {epoch}", end=" - ")
-        _ = test(args, model, test_loader, text_features)      
+        _ = test(args, model, val_loader, text_features)
+        
 
 
 def test(args, seg_model, test_loader, text_features):
@@ -113,7 +91,7 @@ def test(args, seg_model, test_loader, text_features):
     image_scores = []
     segment_scores = []
     
-    for _, (image, y, mask) in enumerate(test_loader):
+    for idx, (image, y, mask) in enumerate(test_loader):
         image = image.to(device)
         mask[mask > 0.5], mask[mask <= 0.5] = 1, 0
 
@@ -130,10 +108,10 @@ def test(args, seg_model, test_loader, text_features):
                 anomaly_map = (100.0 * patch_tokens[layer] @ text_features).unsqueeze(0)
                 anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]
                 anomaly_score += anomaly_map.mean()
-            image_scores.append(anomaly_score.cpu())
+            image_scores.append(anomaly_score.cpu().numpy())
 
             # pixel
-            patch_tokens = ori_seg_patch_tokens
+            patch_tokens = ori_seg_patch_tokens.copy()
             anomaly_maps = []
             for layer in range(len(patch_tokens)):
                 patch_tokens[layer] /= patch_tokens[layer].norm(dim=-1, keepdim=True)
@@ -163,13 +141,15 @@ def test(args, seg_model, test_loader, text_features):
     image_scores = (image_scores - image_scores.min()) / (image_scores.max() - image_scores.min())
 
     img_roc_auc_det = roc_auc_score(gt_list, image_scores)
-    print(f'{args.obj} AUC : {round(img_roc_auc_det,4)}')
+
 
     if CLASS_INDEX[args.obj] > 0:
         seg_roc_auc = roc_auc_score(gt_mask_list.flatten(), segment_scores.flatten())
-        print(f'{args.obj} pAUC : {round(seg_roc_auc,4)}')
+        print(f'pAUC : {round(seg_roc_auc,4)}')
+        print(f'AUC : {round(img_roc_auc_det,4)}')
         return seg_roc_auc + img_roc_auc_det
     else:
+        print(f'AUC : {round(img_roc_auc_det,4)}')
         return img_roc_auc_det
 
 if __name__ == '__main__':

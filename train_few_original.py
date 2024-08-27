@@ -1,5 +1,4 @@
 import os
-import time
 import argparse
 import random
 import math
@@ -7,7 +6,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-#from tqdm import tqdm
+from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
 from dataset.medical_few import MedDataset
 from CLIP.clip import create_model
@@ -16,7 +15,7 @@ from CLIP.adapter import CLIP_Inplanted
 from PIL import Image
 from sklearn.metrics import roc_auc_score, precision_recall_curve, pairwise
 from loss import FocalLoss, BinaryDiceLoss
-from utils import augment, cos_sim, encode_text_with_prompt_ensemble, cos_sim_parallel
+from utils import augment, cos_sim, encode_text_with_prompt_ensemble
 from prompt import REAL_NAME
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -25,8 +24,6 @@ warnings.filterwarnings("ignore")
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda:0" if use_cuda else "cpu")
-
-print(f"Running on: {device}")
 
 CLASS_INDEX = {'Brain':3, 'Liver':2, 'Retina_RESC':1, 'Retina_OCT2017':-1, 'Chest':-2, 'Histopathology':-3}
 
@@ -48,8 +45,7 @@ def main():
     parser.add_argument('--data_path', type=str, default='./data/')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--save_model', type=int, default=1)
-    parser.add_argument('--ckpt_path', type=str, default='./ckpt/few-shot/')
-    parser.add_argument('--ckpt_epoch', type=str, default=0)
+    parser.add_argument('--save_path', type=str, default='./ckpt/few-shot/')
     parser.add_argument('--img_size', type=int, default=240)
     parser.add_argument("--epoch", type=int, default=50, help="epochs")
     parser.add_argument("--learning_rate", type=float, default=0.001, help="learning rate")
@@ -60,9 +56,9 @@ def main():
     args = parser.parse_args()
 
     setup_seed(args.seed)
+
     print(f"OBJECT: {args.obj}")
 
-    
     # fixed feature extractor
     clip_model = create_model(model_name=args.model_name, img_size=args.img_size, device=device, pretrained=args.pretrain, require_pretrained=True)
     clip_model.eval()
@@ -70,18 +66,12 @@ def main():
     model = CLIP_Inplanted(clip_model=clip_model, features=args.features_list).to(device)
     model.eval()
 
-    # for single epoch test
-#    checkpoint = torch.load(os.path.join(f'{args.ckpt_path}', f'{args.obj}-{args.ckpt_epoch}.pth'))
-#    model.seg_adapters.load_state_dict(checkpoint["seg_adapters"])
-#    model.det_adapters.load_state_dict(checkpoint["det_adapters"])
-
     for name, param in model.named_parameters():
         param.requires_grad = True
 
     # optimizer for only adapters
     seg_optimizer = torch.optim.Adam(list(model.seg_adapters.parameters()), lr=args.learning_rate, betas=(0.5, 0.999))
     det_optimizer = torch.optim.Adam(list(model.det_adapters.parameters()), lr=args.learning_rate, betas=(0.5, 0.999))
-
 
 
     # load test dataset
@@ -100,8 +90,9 @@ def main():
     augment_fewshot_label = torch.cat([torch.Tensor([1] * len(augment_abnorm_img)), torch.Tensor([0] * len(augment_normal_img))], dim=0)
 
     train_dataset = torch.utils.data.TensorDataset(augment_fewshot_img, augment_fewshot_mask, augment_fewshot_label)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, **kwargs)
-
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, **kwargs) # modified: in original batch_size=1
+    print('train_dataset len:', len(train_dataset))
+    print('train_loader len:', len(train_loader))
 
     # memory bank construction
     support_dataset = torch.utils.data.TensorDataset(augment_normal_img)
@@ -120,15 +111,62 @@ def main():
 
     best_result = 0
 
+    for epoch in range(args.epoch):
+        print('epoch ', epoch, ':')
 
-    # for single epoch test
-#    result = test(args, model, test_loader, text_features, seg_mem_features, det_mem_features)
+        loss_list = []
+        for (image, gt, label) in train_loader:
+            image = image.to(device)
+            with torch.cuda.amp.autocast():
+                _, seg_patch_tokens, det_patch_tokens = model(image)
+                seg_patch_tokens = [p[:, 1:, :] for p in seg_patch_tokens] # modified: in original p[0, 1:, :]
+                det_patch_tokens = [p[:, 1:, :] for p in det_patch_tokens] # modified: in original p[0, 1:, :]
+                    
+                # det loss
+                det_loss = 0
+                image_label = label.to(device)
+                for layer in range(len(det_patch_tokens)):
+                    det_patch_tokens[layer] = det_patch_tokens[layer] / det_patch_tokens[layer].norm(dim=-1, keepdim=True)
+                    anomaly_map = (100.0 * det_patch_tokens[layer] @ text_features)#.unsqueeze(0) removed from original --> not working     
+                    anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]
+                    anomaly_score = torch.mean(anomaly_map, dim=-1)
+                    det_loss += loss_bce(anomaly_score, image_label)
 
-    # for multiple epochs test
-    for epoch in range(50):
-        checkpoint = torch.load(os.path.join(f'{args.ckpt_path}', f'{args.obj}-{epoch}.pth'), map_location=device)
-        model.seg_adapters.load_state_dict(checkpoint["seg_adapters"])
-        model.det_adapters.load_state_dict(checkpoint["det_adapters"])
+                if CLASS_INDEX[args.obj] > 0:
+                    # pixel level
+                    seg_loss = 0
+                    mask = gt.squeeze(0).to(device)
+                    mask[mask > 0.5], mask[mask <= 0.5] = 1, 0
+                    for layer in range(len(seg_patch_tokens)):
+                        seg_patch_tokens[layer] = seg_patch_tokens[layer] / seg_patch_tokens[layer].norm(dim=-1, keepdim=True)
+                        anomaly_map = (100.0 * seg_patch_tokens[layer] @ text_features)#.unsqueeze(0) removed from original --> not working    
+                        B, L, C = anomaly_map.shape
+                        H = int(np.sqrt(L))
+                        anomaly_map = F.interpolate(anomaly_map.permute(0, 2, 1).view(B, 2, H, H),
+                                                    size=args.img_size, mode='bilinear', align_corners=True)
+                        anomaly_map = torch.softmax(anomaly_map, dim=1)
+                        seg_loss += loss_focal(anomaly_map, mask)
+                        seg_loss += loss_dice(anomaly_map[:, 1, :, :], mask)
+                    
+                    loss = seg_loss + det_loss
+                    loss.requires_grad_(True)
+                    seg_optimizer.zero_grad()
+                    det_optimizer.zero_grad()
+                    loss.backward()
+                    seg_optimizer.step()
+                    det_optimizer.step()
+
+                else:
+                    loss = det_loss
+                    loss.requires_grad_(True)
+                    det_optimizer.zero_grad()
+                    loss.backward()
+                    det_optimizer.step()
+
+                loss_list.append(loss.item())
+
+        print("Loss: ", np.mean(loss_list))
+
 
         seg_features = []
         det_features = []
@@ -142,10 +180,18 @@ def main():
                 det_features.append(det_patch_tokens)
         seg_mem_features = [torch.cat([seg_features[j][i] for j in range(len(seg_features))], dim=0) for i in range(len(seg_features[0]))]
         det_mem_features = [torch.cat([det_features[j][i] for j in range(len(det_features))], dim=0) for i in range(len(det_features[0]))]
-    
+        
 
-        print(f"epoch {epoch}", end=" - ")
-        _ = test(args, model, test_loader, text_features, seg_mem_features, det_mem_features)    
+        result = test(args, model, test_loader, text_features, seg_mem_features, det_mem_features)
+        if True:#result > best_result:
+            #best_result = result
+            if args.save_model == 1:
+                ckp_path = os.path.join(args.save_path, f'{args.obj}-{epoch}.pth')
+                torch.save({'seg_adapters': model.seg_adapters.state_dict(),
+                            'det_adapters': model.det_adapters.state_dict()}, 
+                            ckp_path)
+          
+
 
 def test(args, model, test_loader, text_features, seg_mem_features, det_mem_features):
     gt_list = []
@@ -157,7 +203,7 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
     seg_score_map_zero = []
     seg_score_map_few= []
 
-    for idx, (image, y, mask) in enumerate(test_loader):
+    for (image, y, mask) in tqdm(test_loader):
         image = image.to(device)
         mask[mask > 0.5], mask[mask <= 0.5] = 1, 0
 
@@ -200,9 +246,9 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
                 # few-shot, det head
                 anomaly_maps_few_shot = []
                 for idx, p in enumerate(det_patch_tokens):
-                    cos = cos_sim(det_mem_features[idx], p)
+                    cos = cos_sim(det_mem_features[idx], p) # shape: 290Nimgs x 289
                     height = int(np.sqrt(cos.shape[1]))
-                    anomaly_map_few_shot = torch.min((1 - cos), 0)[0].reshape(1, 1, height, height)
+                    anomaly_map_few_shot = torch.min((1 - cos), 0)[0].reshape(1, 1, height, height) # shape: 1 x 1 x 17 x 17
                     anomaly_map_few_shot = F.interpolate(torch.tensor(anomaly_map_few_shot),
                                                             size=args.img_size, mode='bilinear', align_corners=True)
                     anomaly_maps_few_shot.append(anomaly_map_few_shot[0].cpu().numpy())
@@ -236,25 +282,16 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
 
         seg_score_map_zero = (seg_score_map_zero - seg_score_map_zero.min()) / (seg_score_map_zero.max() - seg_score_map_zero.min())
         seg_score_map_few = (seg_score_map_few - seg_score_map_few.min()) / (seg_score_map_few.max() - seg_score_map_few.min())
-
     
         segment_scores = 0.5 * seg_score_map_zero + 0.5 * seg_score_map_few
-        #seg_roc_auc = roc_auc_score(gt_mask_list.flatten(), segment_scores.flatten())
-        #seg_roc_auc_onlyzero = roc_auc_score(gt_mask_list.flatten(), seg_score_map_zero.flatten()) # ADDED
-        #seg_roc_auc_onlyfew = roc_auc_score(gt_mask_list.flatten(), seg_score_map_few.flatten()) # ADDED
-        #print(f'{args.obj} pAUC : {round(seg_roc_auc,4)}')
-        #print(f'{args.obj} pAUC zero : {round(seg_roc_auc_onlyzero,4)}') # ADDED
-        #print(f'{args.obj} pAUC few : {round(seg_roc_auc_onlyfew,4)}') # ADDED
+        seg_roc_auc = roc_auc_score(gt_mask_list.flatten(), segment_scores.flatten())
+        print(f'{args.obj} pAUC : {round(seg_roc_auc,4)}')
 
         segment_scores_flatten = segment_scores.reshape(segment_scores.shape[0], -1)
         roc_auc_im = roc_auc_score(gt_list, np.max(segment_scores_flatten, axis=1))
-        roc_auc_im_onlyzero = roc_auc_score(gt_list, np.max(seg_score_map_zero, axis=(1,2,3))) # ADDED
-        roc_auc_im_onlyfew = roc_auc_score(gt_list, np.max(seg_score_map_few, axis=(1,2,3))) # ADDED
         print(f'{args.obj} AUC : {round(roc_auc_im, 4)}')
-        print(f'{args.obj} AUC zero : {round(roc_auc_im_onlyzero, 4)}') # ADDED
-        print(f'{args.obj} AUC few : {round(roc_auc_im_onlyfew, 4)}') # ADDED
 
-        return roc_auc_im #+ seg_roc_auc
+        return seg_roc_auc + roc_auc_im
 
     else:
 
@@ -266,15 +303,9 @@ def test(args, model, test_loader, text_features, seg_mem_features, det_mem_feat
     
         image_scores = 0.5 * det_image_scores_zero + 0.5 * det_image_scores_few
         img_roc_auc_det = roc_auc_score(gt_list, image_scores)
-        img_roc_auc_onlyzero = roc_auc_score(gt_list, det_image_scores_zero)
-        img_roc_auc_onlyfew = roc_auc_score(gt_list, det_image_scores_few)
         print(f'{args.obj} AUC : {round(img_roc_auc_det,4)}')
-        print(f'{args.obj} AUC zero : {round(img_roc_auc_onlyzero,4)}')
-        print(f'{args.obj} AUC few : {round(img_roc_auc_onlyfew,4)}')
 
         return img_roc_auc_det
-
-
 
 
 

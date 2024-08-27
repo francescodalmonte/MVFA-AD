@@ -20,7 +20,7 @@ from utils import augment, encode_text_with_prompt_ensemble
 from prompt import REAL_NAME
 
 import warnings
-warnings.filterwarnings("ignore")
+#warnings.filterwarnings("ignore")
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda:0" if use_cuda else "cpu")
@@ -44,6 +44,8 @@ def main():
     parser.add_argument('--pretrain', type=str, default='openai', help="laion400m, openai")
     parser.add_argument('--obj', type=str, default='Retina_RESC')
     parser.add_argument('--data_path', type=str, default='./data/')
+    parser.add_argument('--save_model', type=int, default=1)
+    parser.add_argument('--save_path', type=str, default='./ckpt/zero-shot/')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--img_size', type=int, default=240)
     parser.add_argument("--epoch", type=int, default=50, help="epochs")
@@ -51,6 +53,8 @@ def main():
     parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24], help="features used")
     parser.add_argument('--seed', type=int, default=111)
     args = parser.parse_args()
+
+    print(f"OBJ: {args.obj}")
 
     setup_seed(args.seed)
     
@@ -74,6 +78,7 @@ def main():
     kwargs = {'num_workers': 4, 'pin_memory': True} if use_cuda else {}
     train_dataset = MedTrainDataset(args.data_path, args.obj, args.img_size, args.batch_size)
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, **kwargs)
+    print(f"Len train Dataloader: {len(train_loader)}")
 
     test_dataset = MedTestDataset(args.data_path, args.obj, args.img_size)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, **kwargs)
@@ -98,46 +103,51 @@ def main():
         print(f"epoch {epoch}")
 
         loss_list = []
+        focal_list = [] # added
+        dice_list = [] # added
+        bce_list = [] # added
         for idx, (image, image_label, mask, seg_idx) in enumerate(train_loader):
-            if idx % (len(train_loader) // 5) == 0:
-                print(f"{idx}/{len(train_loader)}")
-                test(args, model, test_loader, text_feature_list[CLASS_INDEX[args.obj]])
+            #if idx % (len(train_loader) // 5) == 0:
+            #    print(f"{idx}/{len(train_loader)}")
+            #    test(args, model, test_loader, text_feature_list[CLASS_INDEX[args.obj]])
 
             image = image.squeeze(0).to(device)
             seg_idx = seg_idx.item()
 
             with torch.cuda.amp.autocast():
                 _, seg_patch_tokens, det_patch_tokens = model(image)
-                seg_patch_tokens = [p[0, 1:, :] for p in seg_patch_tokens]
-                det_patch_tokens = [p[0, 1:, :] for p in det_patch_tokens]
+                seg_patch_tokens = [p[:, 1:, :] for p in seg_patch_tokens] #Original version: p[0, 1:, :] --> not working
+                det_patch_tokens = [p[:, 1:, :] for p in det_patch_tokens] #Original version: p[0, 1:, :] --> not working
 
                 # image level
                 det_loss = 0
                 image_label = image_label.squeeze(0).to(device)
                 for layer in range(len(det_patch_tokens)):
-                    det_patch_tokens[layer] = det_patch_tokens[layer] / det_patch_tokens[layer].norm(dim=-1, keepdim=True)
-                    anomaly_map = (100.0 * det_patch_tokens[layer] @ text_feature_list[seg_idx]).unsqueeze(0)    
+                    det_patch_tokens[layer] = det_patch_tokens[layer] / (det_patch_tokens[layer].norm(dim=-1, keepdim=True) + 1e-10) # added + 1e-10
+                    anomaly_map = (100.0 * det_patch_tokens[layer] @ text_feature_list[seg_idx])#.unsqueeze(0) removed from original --> not working    
                     anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, 1]
-                    anomaly_score = torch.mean(anomaly_map, dim=-1)
+                    anomaly_score = torch.nanmean(anomaly_map, dim=-1)
                     det_loss += loss_bce(anomaly_score, image_label)
 
 
                 if seg_idx > 0:
                     # pixel level
-                    seg_loss = 0
+                    lfocal = 0
+                    ldice = 0
                     mask = mask.squeeze(0).to(device)
                     mask[mask > 0.5], mask[mask <= 0.5] = 1, 0
                     for layer in range(len(seg_patch_tokens)):
-                        seg_patch_tokens[layer] = seg_patch_tokens[layer] / seg_patch_tokens[layer].norm(dim=-1, keepdim=True)
+                        seg_patch_tokens[layer] = seg_patch_tokens[layer] / (seg_patch_tokens[layer].norm(dim=-1, keepdim=True) + 1e-10) # added + 1e-10
                         # print(seg_patch_tokens[layer].shape, text_feature_list[seg_idx].shape) # torch.Size([289, 768]) torch.Size([768, 2])
-                        anomaly_map = (100.0 * seg_patch_tokens[layer] @ text_feature_list[seg_idx]).unsqueeze(0)
+                        anomaly_map = (100.0 * seg_patch_tokens[layer] @ text_feature_list[seg_idx])#.unsqueeze(0) removed from original --> not working    
                         B, L, C = anomaly_map.shape
                         H = int(np.sqrt(L))
                         anomaly_map = F.interpolate(anomaly_map.permute(0, 2, 1).view(B, 2, H, H),
                                                     size=args.img_size, mode='bilinear', align_corners=True)
                         anomaly_map = torch.softmax(anomaly_map, dim=1)
-                        seg_loss += loss_focal(anomaly_map, mask)
-                        seg_loss += loss_dice(anomaly_map[:, 1, :, :], mask)
+                        lfocal += loss_focal(anomaly_map, mask) # added
+                        ldice += loss_dice(anomaly_map[:, 1, :, :], mask) # added
+                    seg_loss = lfocal + ldice
                     
                     loss = seg_loss + det_loss # = focal(seg_out, mask) + bce(det_out, y)
                     loss.requires_grad_(True)
@@ -155,16 +165,27 @@ def main():
                     det_optimizer.step()
 
                 loss_list.append(loss.item())
+                focal_list.append(lfocal.item()) # added
+                dice_list.append(ldice.item()) # added
+                bce_list.append(det_loss.item()) # added
+
 
         train_dataset.shuffle_dataset()
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, **kwargs)
 
         # logs
-        print(f"Loss: {np.mean(loss_list)}")
+        if np.any(np.array([l!=l for l in loss_list])):
+            print(f"Loss list {loss_list} contains nans!")
+        print(f"Loss: {np.nanmean(loss_list)} - Focal: {np.nanmean(focal_list)} - Dice: {np.nanmean(dice_list)} - BCE: {np.nanmean(bce_list)}")
 
-        print("Running evaluation...")
-        score = test(args, model, test_loader, text_feature_list[CLASS_INDEX[args.obj]])
-            
+        # added
+        #print("Running evaluation...")
+        #score = test(args, model, test_loader, text_feature_list[CLASS_INDEX[args.obj]]) 
+        if args.save_model == 1:
+            ckp_path = os.path.join(args.save_path, f'{args.obj}-{epoch}.pth')
+            torch.save({'seg_adapters': model.seg_adapters.state_dict(),
+                        'det_adapters': model.det_adapters.state_dict()}, 
+                        ckp_path)
         
 
 

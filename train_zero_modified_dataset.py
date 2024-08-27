@@ -11,7 +11,7 @@ from torchvision.ops import focal_loss
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 #from scipy.ndimage import gaussian_filter
-from dataset.medical_zero import MedTestDataset, MedTrainDataset_modified
+from dataset.medical_zero import MedTestDataset, MedTrainDataset_modified, MedValDataset
 from CLIP.clip import create_model
 from CLIP.tokenizer import tokenize
 from CLIP.adapter import CLIP_Inplanted
@@ -21,6 +21,7 @@ from loss import FocalLoss, BinaryDiceLoss
 from utils import augment, encode_text_with_prompt_ensemble
 from prompt import REAL_NAME
 
+from torch.utils.tensorboard import SummaryWriter
 
 #import warnings
 #warnings.filterwarnings("ignore")
@@ -64,14 +65,12 @@ def main():
 
     setup_seed(args.seed)
 
-    
     print(f"Using device: {device}")
-    print(f"----- Running zero-shot training for class: {args.obj} -----")
+    print(f"OBJECT: {args.obj}")
 
-    # create log dir
-    if not os.path.exists(args.log_dir):
-        os.makedirs(args.log_dir)
-    
+    # tensorboard
+    writer = SummaryWriter(log_dir=args.log_dir)
+
     # fixed feature extractor
     print("Instantiating model...")
     clip_model = create_model(model_name=args.model_name, img_size=args.img_size, device=device, pretrained=args.pretrain, require_pretrained=True)
@@ -81,12 +80,17 @@ def main():
     model.eval()
 
     for name, param in model.named_parameters():
-        param.requires_grad = True
+        if name.startswith("seg_adapters") or name.startswith("det_adapters"):
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
 
 
     # optimizer for only adapters
     seg_optimizer = torch.optim.Adam(list(model.seg_adapters.parameters()), lr=args.learning_rate, betas=(0.5, 0.999))
     det_optimizer = torch.optim.Adam(list(model.det_adapters.parameters()), lr=args.learning_rate, betas=(0.5, 0.999))
+    #seg_optimizer = torch.optim.SGD(list(model.seg_adapters.parameters()), lr=args.learning_rate, momentum=0.9)
+    #det_optimizer = torch.optim.SGD(list(model.det_adapters.parameters()), lr=args.learning_rate, momentum=0.9)
 
 
     # load dataset and loader
@@ -95,10 +99,12 @@ def main():
     train_dataset = MedTrainDataset_modified(args.data_path, args.obj, args.img_size)
     train_loader = torch.utils.data.DataLoader(train_dataset, args.batch_size, shuffle=True, **kwargs)
     print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Train loader len: {len(train_loader)}")
 
-    test_dataset = MedTestDataset(args.data_path, args.obj, args.img_size)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.test_batch_size, shuffle=False, **kwargs)
-    print(f"Test dataset size: {len(test_dataset)}")
+    val_dataset = MedValDataset(args.data_path, args.obj, args.img_size)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.test_batch_size, shuffle=False, **kwargs)
+    print(f"Val dataset size: {len(val_dataset)}")
+    print(f"Val loader len: {len(val_loader)}")
 
 
     # losses
@@ -115,7 +121,6 @@ def main():
             text_feature = encode_text_with_prompt_ensemble(clip_model, REAL_NAME[CLASS_INDEX_INV[i]], device)
             text_feature_list.append(text_feature)
 
-    save_score = 0.0
     epoch_losses_dict = {
         "focal" : [],
         "dice" : [],
@@ -133,7 +138,6 @@ def main():
         tot_loss_list = []
 
         for i, (image, image_label, mask, seg_idx) in enumerate(train_loader):
-
             image = image.to(device)
             image_label = image_label.to(device)
             mask = mask.to(device)
@@ -150,23 +154,22 @@ def main():
                 text_feature_batch = torch.stack([text_feature_list[s] for s in seg_idx]) # shape: B x 768 x 2
 
 
-
                 # 1. IMAGE LEVEL LOSS
+                # normalize
                 det_patch_tokens = det_patch_tokens / det_patch_tokens.norm(dim=-1, keepdim=True) # shape: B x 4 x 289 x 768
-                
-                # multiply DET tokens with text features (TODO: parallelize)
-                anomaly_map = []
-                for b in range(det_patch_tokens.shape[0]):
-                    anomaly_map.append((100.0 * det_patch_tokens[b, :, :, :] @ text_feature_batch[b]))
-                anomaly_map = torch.stack(anomaly_map) # shape: B x 4 x 289 x 2
+
+                # multiply DET tokens with text features (NB: text_features is a 3D tensor here)
+                text_feature_batch = text_feature_batch.permute(0,2,1) # shape: B x 2 x 768
+                det_patch_tokens = det_patch_tokens.permute(1,0,3,2) # shape: 4 x B x 768 x 289
+                anomaly_map = 100*torch.matmul(text_feature_batch, det_patch_tokens).permute(1,0,3,2) # shape: B x 4 x 289 x 2
+
                 anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, :, 1] # shape: B x 4 x 289
                 anomaly_score = torch.mean(anomaly_map, dim=-1) # shape: B x 4
 
                 # compute det loss (bce)
                 det_loss = 0
                 for l in range(anomaly_score.shape[1]):
-                    det_loss = det_loss + loss_bce(anomaly_score[:, l], image_label)
-                det_loss = det_loss/len(anomaly_score.shape[1])
+                    det_loss += loss_bce(anomaly_score[:, l], image_label)
 
                 # 2. PIXEL LEVEL LOSS
                 # only keep elements of the batch that have a segmentation mask
@@ -178,13 +181,12 @@ def main():
                 text_feature_batch = text_feature_batch[tokeep_mask]
                 mask = mask[tokeep_mask]
 
+                # normalize
                 seg_patch_tokens = seg_patch_tokens / seg_patch_tokens.norm(dim=-1, keepdim=True)
 
-                # multiply SEG tokens with text features (TODO: parallelize)
-                anomaly_map = []
-                for b in range(seg_patch_tokens.shape[0]):
-                    anomaly_map.append((100.0 * seg_patch_tokens[b, :, :, :] @ text_feature_batch[b]))
-                anomaly_map = torch.stack(anomaly_map) # shape: B* x 4 x 289 x 2
+                # multiply SEG tokens with text features (NB: text_features is a 3D tensor here)
+                seg_patch_tokens = seg_patch_tokens.permute(1,0,3,2) # shape: 4 x B* x 768 x 289
+                anomaly_map = 100*torch.matmul(text_feature_batch, seg_patch_tokens).permute(1,0,3,2) # shape: B* x 4 x 289 x 2
                 anomaly_map = torch.softmax(anomaly_map, dim=-1)[:, :, :, 1] # shape: B* x 4 x 289
 
                 # resize/reshape anomaly_map to image size
@@ -208,7 +210,7 @@ def main():
                 seg_loss = loss_d + loss_f
                     
                 # total loss
-                tot_loss = seg_loss + det_loss
+                tot_loss = det_loss + seg_loss
 
                 # store losses
                 bce_loss_list.append(det_loss.item())
@@ -216,8 +218,8 @@ def main():
                 dice_loss_list.append(loss_d.item())
                 tot_loss_list.append(tot_loss.item())
 
+
                 # backward pass
-                tot_loss.requires_grad_(True)
                 seg_optimizer.zero_grad()
                 det_optimizer.zero_grad()
                 tot_loss.backward()
@@ -235,21 +237,25 @@ def main():
         epoch_losses_dict["bce"].append(np.mean(bce_loss_list))
         epoch_losses_dict["total"].append(np.mean(tot_loss_list))
 
-        print(f"TOT LOSS: {epoch_losses_dict['total'][-1]:.5f} - elapsed time: {time.time()-start_time:.2f}s")
+        # tensorboard
+        writer.add_scalar("Loss/total", epoch_losses_dict['total'][-1], epoch)
+        writer.add_scalar("Loss/focal", epoch_losses_dict['focal'][-1], epoch)
+        writer.add_scalar("Loss/dice", epoch_losses_dict['dice'][-1], epoch)
+        writer.add_scalar("Loss/bce", epoch_losses_dict['bce'][-1], epoch)
+
+        print(f"TOT LOSS: {epoch_losses_dict['total'][-1]:.5f} - elapsed time: {time.time()-start_time:.2f}s", end=" - ")
         print(f"FOCAL LOSS: {epoch_losses_dict['focal'][-1]:.5f}", end=" - ")
         print(f"DICE LOSS: {epoch_losses_dict['dice'][-1]:.5f}", end=" - ")
         print(f"BCE LOSS: {epoch_losses_dict['bce'][-1]:.5f}")
 
         # test on every epoch
-        if (epoch > -1) : ## ADDED
-            score = test(args, model, test_loader, text_feature_list[CLASS_INDEX[args.obj]])
-            if score >= save_score:
-                save_score = score
-                if args.save_model == 1:
-                    ckp_path = os.path.join(args.save_path, f'{args.obj}.pth')
-                    torch.save({'seg_adapters': model.seg_adapters.state_dict(),
-                                'det_adapters': model.det_adapters.state_dict()}, 
-                                ckp_path)        
+        if (epoch % 1 == 0) : ## ADDED
+            score = test(args, model, val_loader, text_feature_list[CLASS_INDEX[args.obj]])
+            if args.save_model == 1:
+                ckp_path = os.path.join(args.save_path, f'{args.obj}-{epoch}.pth')
+                torch.save({'seg_adapters': model.seg_adapters.state_dict(),
+                            'det_adapters': model.det_adapters.state_dict()}, 
+                            ckp_path)        
         
     with open(f"{args.log_dir}/{args.obj}-losses.csv", "w") as file:
         k = epoch_losses_dict.keys()
@@ -260,14 +266,15 @@ def main():
 
 def test(args, seg_model, test_loader, text_features):
     start_time = time.time()
-    print("**Running test:", end=" ")
+    print("**Running eval...", end=" - ")
 
     gt_list = []
     gt_mask_list = []
     image_scores = []
     segment_scores = []
     
-    for _, (image, y, mask) in enumerate(test_loader):
+    for ib, (image, y, mask) in enumerate(test_loader):
+        #print(f"batch: {ib}/{len(test_loader)}")
         image = image.to(device)
 
         mask[mask > 0.5], mask[mask <= 0.5] = 1, 0
@@ -315,21 +322,16 @@ def test(args, seg_model, test_loader, text_features):
     image_scores = (image_scores - image_scores.min()) / (image_scores.max() - image_scores.min())
 
     img_roc_auc_det = roc_auc_score(gt_list, image_scores)
-    print(f"imageAUC : {round(img_roc_auc_det,4)} - elapsed time: {time.time()-start_time:.2f}s")
+    print(f"elapsed time: {time.time()-start_time:.2f}s")
+    print(f'AUC : {round(img_roc_auc_det,4)}')
 
-    #if CLASS_INDEX[args.obj] > 0:
-    #    seg_roc_auc = roc_auc_score(gt_mask_list.flatten(), segment_scores.flatten())
-    #    print(f'{args.obj} pAUC : {round(seg_roc_auc,4)}')
-    #    return seg_roc_auc + img_roc_auc_det
-    #else:
-    #    return img_roc_auc_det
+    if CLASS_INDEX[args.obj] > 0:
+        seg_roc_auc = roc_auc_score(gt_mask_list.flatten(), segment_scores.flatten())
+        print(f'pAUC : {round(seg_roc_auc,4)}')
+        return seg_roc_auc + img_roc_auc_det
+    else:
+        return img_roc_auc_det
 
-    # save AUROC and scores
-    with open(f"{args.log_dir}/{args.obj}-scores.csv", "w") as file:
-        file.write(f"test: imageAUROC={round(img_roc_auc_det, 5)}\n")
-        file.write("img_score_zero\n")
-        for i in range(image_scores.shape[0]):
-            file.write(f"{image_scores[i]}\n")
 
     return img_roc_auc_det
 
